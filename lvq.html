@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>LVQ Visualization</title>
+<style>
+  :root{--bg:#0f1724;--panel:#0b1220;--accent:#60a5fa;--muted:#9ca3af}
+  html,body{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,'Helvetica Neue',Arial}
+  body{display:flex;gap:16px;background:linear-gradient(180deg,#071025,#081226 40%);color:#e6eef8;padding:18px}
+  .panel{width:360px;background:rgba(255,255,255,0.03);border-radius:12px;padding:14px;box-shadow:0 6px 18px rgba(2,6,23,0.6)}
+  h1{font-size:18px;margin:0 0 8px}
+  label{display:block;font-size:13px;color:var(--muted);margin-top:8px}
+  .row{display:flex;gap:8px;align-items:center}
+  button{background:transparent;border:1px solid rgba(255,255,255,0.08);padding:8px 10px;border-radius:8px;color:inherit;cursor:pointer}
+  input[type=range]{width:100%}
+  .canvas-wrap{flex:1;display:flex;align-items:center;justify-content:center}
+  canvas{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:10px;box-shadow:0 8px 36px rgba(2,6,23,0.6)}
+  .credits{font-size:12px;color:var(--muted);margin-top:10px}
+  .small{font-size:12px;color:var(--muted)}
+  .controls-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .stat{margin-top:6px;font-size:13px}
+  .danger{color:#ff8a8a}
+</style>
+</head>
+<body>
+  <div class="panel">
+    <h1>LVQ Visualization (2D)</h1>
+    <div class="small">Prototype-based classification visualized live. Drag prototypes, change learning rate, add noise & classes.</div>
+
+    <label>Learning rate <span id="lrVal">0.20</span></label>
+    <input id="lr" type="range" min="0.01" max="1" step="0.01" value="0.2">
+
+    <label>Decay (per 1000 steps) <span id="decayVal">0.995</span></label>
+    <input id="decay" type="range" min="0.90" max="1" step="0.001" value="0.995">
+
+    <label>Prototypes per class <span id="ppcVal">2</span></label>
+    <input id="ppc" type="range" min="1" max="5" step="1" value="2">
+
+    <label>Noise (std dev) <span id="noiseVal">0.08</span></label>
+    <input id="noise" type="range" min="0" max="0.4" step="0.01" value="0.08">
+
+    <label>Classes <span id="classesVal">3</span></label>
+    <input id="classes" type="range" min="2" max="5" step="1" value="3">
+
+    <div style="margin-top:10px" class="row">
+      <button id="start">Start</button>
+      <button id="pause">Pause</button>
+      <button id="step">Step</button>
+      <button id="reset">Reset</button>
+    </div>
+
+    <div style="margin-top:10px" class="controls-grid">
+      <div>
+        <label>Train iterations per frame</label>
+        <input id="iters" type="range" min="1" max="500" step="1" value="100">
+        <div class="small"><span id="itersVal">100</span> iters / frame</div>
+      </div>
+      <div>
+        <label>Toggle background</label>
+        <div class="row" style="margin-top:6px"><button id="togBg">Toggle</button></div>
+      </div>
+    </div>
+
+    <div class="stat">Step: <span id="stepCount">0</span></div>
+    <div class="stat">Accuracy (on training set): <b id="acc">0%</b></div>
+    <div class="stat">Prototypes: <span id="protoCount">0</span></div>
+
+    <div class="credits">Tip: drag prototypes (colored squares) to reposition. Click Step to run a small batch. Reset regenerates dataset and prototypes.</div>
+  </div>
+
+  <div class="canvas-wrap">
+    <canvas id="c" width="900" height="640"></canvas>
+  </div>
+
+<script>
+// LVQ1 visualization - self-contained
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = canvas.width, H = canvas.height;
+
+// UI
+const lrEl = document.getElementById('lr');
+const decayEl = document.getElementById('decay');
+const ppcEl = document.getElementById('ppc');
+const noiseEl = document.getElementById('noise');
+const classesEl = document.getElementById('classes');
+const itersEl = document.getElementById('iters');
+const startBtn = document.getElementById('start');
+const pauseBtn = document.getElementById('pause');
+const stepBtn = document.getElementById('step');
+const resetBtn = document.getElementById('reset');
+const togBgBtn = document.getElementById('togBg');
+
+const lrVal = document.getElementById('lrVal');
+const decayVal = document.getElementById('decayVal');
+const ppcVal = document.getElementById('ppcVal');
+const noiseVal = document.getElementById('noiseVal');
+const classesVal = document.getElementById('classesVal');
+const itersVal = document.getElementById('itersVal');
+const stepCountEl = document.getElementById('stepCount');
+const accEl = document.getElementById('acc');
+const protoCountEl = document.getElementById('protoCount');
+
+let showBg = true;
+
+// Data and model
+let data = []; // {x,y,label}
+let prototypes = []; // {x,y,label}
+let numClasses = parseInt(classesEl.value);
+let prototypesPerClass = parseInt(ppcEl.value);
+let learningRate = parseFloat(lrEl.value);
+let decay = parseFloat(decayEl.value);
+let noise = parseFloat(noiseEl.value);
+let itersPerFrame = parseInt(itersEl.value);
+let stepCount = 0;
+let running = false;
+
+// Colors
+const palette = ['#ef4444','#f59e0b','#10b981','#3b82f6','#8b5cf6'];
+
+function randn_bm(){ // approximate normal
+  let u = 0, v = 0;
+  while(u===0) u = Math.random();
+  while(v===0) v = Math.random();
+  return Math.sqrt(-2.0*Math.log(u))*Math.cos(2.0*Math.PI*v);
+}
+
+function generateData(){
+  data = [];
+  const classes = numClasses;
+  for(let k=0;k<classes;k++){
+    // cluster center on a circle
+    const ang = (k/classes)*Math.PI*2;
+    const cx = 0.5 + 0.28*Math.cos(ang);
+    const cy = 0.5 + 0.28*Math.sin(ang);
+    // pick number of points
+    const n = 120;
+    for(let i=0;i<n;i++){
+      const r = 0.08 + Math.abs(randn_bm())*noise;
+      const theta = Math.random()*Math.PI*2;
+      const x = cx + r*Math.cos(theta);
+      const y = cy + r*Math.sin(theta);
+      data.push({x: clamp(x,0,1), y: clamp(y,0,1), label: k});
+    }
+  }
+}
+
+function initPrototypes(){
+  prototypes = [];
+  for(let k=0;k<numClasses;k++){
+    // find random points near class center
+    for(let p=0;p<prototypesPerClass;p++){
+      // initialize near one random data point of the class
+      const clsPoints = data.filter(d=>d.label===k);
+      const r = clsPoints[Math.floor(Math.random()*clsPoints.length)];
+      const x = clamp(r.x + randn_bm()*0.03,0,1);
+      const y = clamp(r.y + randn_bm()*0.03,0,1);
+      prototypes.push({x,y,label:k});
+    }
+  }
+}
+
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+
+function pickRandomSample(){
+  return data[Math.floor(Math.random()*data.length)];
+}
+
+function nearestPrototype(x,y){
+  let best = null; let bestd = Infinity;
+  prototypes.forEach((p,i)=>{
+    const dx = p.x - x, dy = p.y - y; const d = dx*dx+dy*dy;
+    if(d<bestd){bestd=d; best=i}
+  });
+  return best;
+}
+
+function trainStep(){
+  // LVQ1 single step
+  const s = pickRandomSample();
+  const i = nearestPrototype(s.x,s.y);
+  const p = prototypes[i];
+  const eps = learningRate;
+  if(p.label === s.label){
+    // move toward
+    p.x += eps*(s.x - p.x);
+    p.y += eps*(s.y - p.y);
+  } else {
+    // move away
+    p.x -= eps*(s.x - p.x);
+    p.y -= eps*(s.y - p.y);
+  }
+}
+
+function trainMultiple(n){
+  for(let i=0;i<n;i++){
+    trainStep();
+    stepCount++;
+    // decay schedule
+    if(stepCount % 1000 === 0){ learningRate *= decay; }
+  }
+}
+
+function computeAccuracy(){
+  let ok=0;
+  for(const s of data){
+    const idx = nearestPrototype(s.x,s.y);
+    if(prototypes[idx].label===s.label) ok++;
+  }
+  return ok/data.length;
+}
+
+// Rendering
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // background decision regions (coarse grid)
+  if(showBg){
+    const step = 8; // coarser for speed
+    for(let gx=0;gx<W;gx+=step){
+      for(let gy=0;gy<H;gy+=step){
+        const x = gx/W, y = gy/H;
+        const idx = nearestPrototype(x,y);
+        const col = hexToRgba(palette[prototypes[idx].label],0.08);
+        ctx.fillStyle = col;
+        ctx.fillRect(gx,gy,step,step);
+      }
+    }
+  }
+
+  // data points
+  for(const pt of data){
+    const sx = pt.x*W, sy = pt.y*H;
+    ctx.beginPath(); ctx.globalAlpha = 0.9;
+    ctx.fillStyle = palette[pt.label];
+    ctx.arc(sx,sy,3,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // prototypes
+  for(const p of prototypes){
+    const sx = p.x*W, sy = p.y*H;
+    ctx.fillStyle = palette[p.label];
+    ctx.strokeStyle = '#e6eef8';
+    ctx.lineWidth = 1;
+    // draw square
+    const s = 10;
+    ctx.fillRect(sx-s/2, sy-s/2, s, s);
+    ctx.strokeRect(sx-s/2-1, sy-s/2-1, s+2, s+2);
+  }
+
+  // overlay stats
+  ctx.fillStyle = 'rgba(255,255,255,0.04)';
+  ctx.fillRect(8,8,200,56);
+  ctx.fillStyle = '#bfe0ff'; ctx.font='12px Inter, Arial';
+  ctx.fillText('LVQ1 - prototypes: '+prototypes.length, 16, 26);
+  ctx.fillText('Step: '+stepCount, 16, 44);
+}
+
+function hexToRgba(hex,a){
+  const c = hex.substring(1); const bigint = parseInt(c,16);
+  const r=(bigint>>16)&255,g=(bigint>>8)&255,b=bigint&255;
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+// Animation loop
+function loop(){
+  if(running){
+    trainMultiple(itersPerFrame);
+    updateUI();
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// UI wiring
+lrEl.addEventListener('input',()=>{ learningRate = parseFloat(lrEl.value); lrVal.textContent = learningRate.toFixed(2); });
+decayEl.addEventListener('input',()=>{ decay = parseFloat(decayEl.value); decayVal.textContent = decay.toFixed(3); });
+ppcEl.addEventListener('input',()=>{ prototypesPerClass = parseInt(ppcEl.value); ppcVal.textContent = prototypesPerClass; resetModel(); });
+noiseEl.addEventListener('input',()=>{ noise = parseFloat(noiseEl.value); noiseVal.textContent = noise.toFixed(2); regenerateData(); });
+classesEl.addEventListener('input',()=>{ numClasses = parseInt(classesEl.value); classesVal.textContent = numClasses; regenerateData(); });
+itersEl.addEventListener('input',()=>{ itersPerFrame = parseInt(itersEl.value); itersVal.textContent = itersPerFrame; });
+
+startBtn.addEventListener('click',()=>{ running=true; });
+pauseBtn.addEventListener('click',()=>{ running=false; });
+stepBtn.addEventListener('click',()=>{ trainMultiple(itersPerFrame); updateUI(); draw(); });
+resetBtn.addEventListener('click',()=>{ regenerateData(); });
+
+togBgBtn.addEventListener('click',()=>{ showBg = !showBg; });
+
+function regenerateData(){
+  numClasses = parseInt(classesEl.value);
+  prototypesPerClass = parseInt(ppcEl.value);
+  noise = parseFloat(noiseEl.value);
+  generateData();
+  initPrototypes();
+  stepCount = 0; learningRate = parseFloat(lrEl.value);
+  updateUI();
+}
+
+function resetModel(){
+  initPrototypes(); stepCount=0; learningRate = parseFloat(lrEl.value); updateUI();
+}
+
+function updateUI(){
+  stepCountEl.textContent = stepCount;
+  accEl.textContent = (computeAccuracy()*100).toFixed(1)+'%';
+  protoCountEl.textContent = prototypes.length;
+}
+
+// dragging prototypes
+let dragging = null;
+canvas.addEventListener('mousedown',(ev)=>{
+  const rect = canvas.getBoundingClientRect();
+  const x = (ev.clientX-rect.left)/W, y=(ev.clientY-rect.top)/H;
+  // find prototype hit
+  for(let i=0;i<prototypes.length;i++){
+    const p = prototypes[i];
+    const dx = p.x - x, dy = p.y - y;
+    if(Math.sqrt(dx*dx+dy*dy) < 0.03){ dragging = i; running=false; break; }
+  }
+});
+window.addEventListener('mousemove',(ev)=>{
+  if(dragging===null) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = clamp((ev.clientX-rect.left)/W,0,1), y = clamp((ev.clientY-rect.top)/H,0,1);
+  prototypes[dragging].x = x; prototypes[dragging].y = y; updateUI();
+});
+window.addEventListener('mouseup',()=>{ dragging=null; });
+
+// responsiveness
+window.addEventListener('resize',()=>{
+  // keep canvas size fixed by CSS? keep for now
+});
+
+// init
+generateData(); initPrototypes(); updateUI(); loop();
+
+</script>
+</body>
+</html>
